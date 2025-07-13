@@ -1,0 +1,21 @@
+name: pyg-cuda12
+channels:
+  - pytorch
+  - nvidia
+  - pyg
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - h5py
+  - pip
+  - pytorch=2.3.0
+  - pytorch-cuda=12.1  # CUDA 12.5 support from NVIDIA channel
+  - pyg  # Installs torch-geometric and dependencies with correct CUDA bindings
+  - psutil
+  - pip:
+      - awkward
