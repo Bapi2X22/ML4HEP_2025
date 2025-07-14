@@ -1,14 +1,15 @@
 import pickle as pk
 import numpy as np
 # import pandas as pd
-import h5py
+#import h5py
 # import matplotlib.pyplot as plt
 # import awkward as ak
 import torch
-import psutil
+#import psutil
 from torch_geometric.data import Data
-import h5py
+#import h5py
 from torch_geometric.loader import DataLoader
+from torch.utils.data import Dataset, random_split
 import os
 import os.path as osp
 import math
@@ -38,6 +39,7 @@ from torch_geometric.utils import remove_self_loops
 from torch_geometric.nn import (max_pool, max_pool_x, global_max_pool,
                                 avg_pool, avg_pool_x, global_mean_pool, 
                                 global_add_pool)
+from tqdm import tqdm
 
 transform = T.Cartesian(cat=False)
 
@@ -264,23 +266,64 @@ class DynamicReductionNetworkJit(nn.Module):
         return x
 
 print("-----------------Loading torchified data .....")
-torchified_data = torch.load("torchified_data.pt")
+
+class RechitEventDataset(Dataset):
+    def __init__(self, events, target_energy):
+        assert len(events) == len(target_energy)
+        self.events = events
+        self.targets = target_energy
+
+    def __len__(self):
+        return len(self.events)
+
+    def __getitem__(self, idx):
+        e = self.events[idx]
+        y = self.targets[idx]
+
+        x = torch.tensor(e['x'], dtype=torch.float32)
+        y_ = torch.tensor(e['y'], dtype=torch.float32)
+        z = torch.tensor(e['z'], dtype=torch.float32)
+        E = torch.tensor(e['E'], dtype=torch.float32)
+
+        features = torch.stack([x, y_, z, E], dim=-1)
+        pos = features[:, :3]
+        y_target = torch.tensor([y], dtype=torch.float32)
+
+        return Data(x=features, pos=pos, y=y_target)
+    
+with open('events.pkl', 'rb') as f:
+    events = pk.load(f)
+
+target_energy = np.load("target_energy.npy")
+
+dataset = RechitEventDataset(events, target_energy)
+
+train_size = int(0.8 * len(dataset))
+test_size = len(dataset) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=100, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False)
+
+# ------------------------------
+# Train Model with Progress Bar
+# ------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+    
 print("------------------Loading_finished-------------------")
 
 device = 'cuda'
-
-train_loader = DataLoader(torchified_data, batch_size=32, shuffle=True)
 
 model = DynamicReductionNetworkJit(
     input_dim=4,        # [x, y, z, E]
     hidden_dim=64,
     output_dim=1,       # regression target
-    k=8,                # or 16 or 24
+    k=16,                # or 16 or 24
     aggr='add',         # 'mean' or 'max' also possible
-    pool='mean',        # or 'max', 'add'
-    agg_layers=2,
-    mp_layers=2,
-    in_layers=1,
+    pool='max',        # or 'max', 'add'
+    agg_layers=6,
+    mp_layers=3,
+    in_layers=4,
     out_layers=2,
     graph_features=0,   # set >0 if graph_x is used
     latent_probe=None   # or an int to return intermediate latent
@@ -291,16 +334,46 @@ model = model.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 loss_fn = nn.MSELoss()  # or MAE, SmoothL1Loss, etc.
 
-model.train()
-for epoch in range(1, 51):
+for epoch in range(1, 41):
+    model.train()
     total_loss = 0
-    for batch in train_loader:
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}", leave=False)
+
+    for batch in pbar:
         batch = batch.to(device)
         optimizer.zero_grad()
+#        out = model(batch)
         out = model(batch.x, batch.batch, batch.graph_x if hasattr(batch, 'graph_x') else None)
-        loss = loss_fn(out, batch.y)
+        loss = loss_fn(out, batch.y.view(-1))
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-    print(f"Epoch {epoch:02d}, Loss: {total_loss:.4f}")
+        total_loss += loss.item() * batch.num_graphs
+
+        avg_loss = total_loss / ((pbar.n + 1) * batch.num_graphs)
+        pbar.set_postfix(loss=f"{avg_loss:.4f}")
+
+    print(f"Epoch {epoch:03d} completed, Avg Loss: {total_loss / len(train_dataset):.4f}")
+
+torch.save(model.state_dict(), "DRN_regression_model.pt")
+
+model.eval()
+predictions = []
+truths = []
+
+with torch.no_grad():
+    for batch in tqdm(test_loader, desc="Testing", leave=False):
+        batch = batch.to(device)
+#        out = model(batch)
+        out = model(batch.x, batch.batch, batch.graph_x if hasattr(batch, 'graph_x') else None)
+        predictions.extend(out.cpu().numpy())
+        truths.extend(batch.y.cpu().numpy())
+
+predictions = np.array(predictions)
+truths = np.array(truths)
+
+# Save to files
+np.save("predicted_energy_test_DRN.npy", predictions)
+np.save("true_energy_test_DRN.npy", truths)
+print("✅ Predictions saved as .npy files.")
+
 
